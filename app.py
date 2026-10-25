@@ -1,0 +1,89 @@
+import base64
+
+import streamlit as st
+
+import engine
+import sarvam as sv
+
+try:
+    from dotenv import load_dotenv; load_dotenv()
+except ImportError:
+    pass
+
+LANGS = {"English": "en-IN", "हिन्दी (Hindi)": "hi-IN", "বাংলা (Bengali)": "bn-IN", "தமிழ் (Tamil)": "ta-IN",
+         "తెలుగు (Telugu)": "te-IN", "ಕನ್ನಡ (Kannada)": "kn-IN", "മലയാളം (Malayalam)": "ml-IN",
+         "मराठी (Marathi)": "mr-IN", "ગુજરાતી (Gujarati)": "gu-IN", "ਪੰਜਾਬੀ (Punjabi)": "pa-IN", "ଓଡ଼ିଆ (Odia)": "od-IN"}
+
+st.set_page_config(page_title="Policy Explainer", page_icon="🛡️", layout="wide")
+
+with st.sidebar:
+    st.title("🛡️ Policy Explainer")
+    lang = LANGS[st.selectbox("Language / भाषा", list(LANGS))]
+    up = st.file_uploader("Upload health policy (PDF)", type="pdf")
+    if up and st.session_state.get("fname") != up.name:
+        with st.spinner("Reading policy..."):
+            st.session_state.policy = engine.Policy(up.getvalue())
+            st.session_state.fname, st.session_state.chat, st.session_state.summary = up.name, [], {}
+    pol: engine.Policy | None = st.session_state.get("policy")
+    if pol:
+        st.success(f"{up.name if up else ''} · {pol.n_pages} pages · {len(pol.chunks)} clauses")
+        if pol.low_quality:
+            st.warning("Low extraction quality (scanned or unusual layout). Answers may be unreliable.")
+
+st.info(sv.translate(engine.DISCLAIMER, lang))
+if not pol:
+    st.write("👈 Upload a health insurance policy PDF to begin.")
+    st.stop()
+
+
+def show(a: dict, key: str):
+    for m in a["flags"]:
+        st.warning(m)
+    if a["short"]:
+        st.markdown(f"### {a['short']}")
+    for s in a["statements"]:
+        st.write(f"• {s['text']}  `{', '.join(s['cites'])}`")
+    if a["conditions"]:
+        st.markdown("**It depends on:**")
+        for c in a["conditions"]:
+            st.write(f"– {c}")
+    if a["statements"]:
+        st.caption(f"Confidence: {a['confidence']:.0%}")
+        if st.button("🔊 Listen", key=f"tts-{key}"):
+            audio = sv.text_to_speech(a["short"] or a["statements"][0]["text"], lang)
+            if audio:
+                st.audio(base64.b64decode(audio), format="audio/wav")
+    for i, c in enumerate(a["citations"]):
+        with st.expander(f"Page {c['page']} · {c['section']} · clause {c['clause'] or '-'}"):
+            st.caption(f"“{c['quote']}”")
+            st.image(pol.page_png(c["page"], c["quote"]))
+
+
+def ask(question_local: str) -> dict:
+    q_en = sv.translate(question_local, "en-IN", source=lang) if lang != "en-IN" else question_local
+    return engine.answer(pol, q_en, lang)
+
+
+tab1, tab2 = st.tabs(["Coverage summary", "Ask a question"])
+
+with tab1:
+    if st.button("Generate key terms summary", type="primary"):
+        bar = st.progress(0.0)
+        for i, (label, q) in enumerate(engine.SUMMARY_QUESTIONS.items()):
+            st.session_state.summary[label] = engine.answer(pol, q, lang)
+            bar.progress((i + 1) / len(engine.SUMMARY_QUESTIONS))
+    cols = st.columns(2)
+    for i, (label, a) in enumerate(st.session_state.get("summary", {}).items()):
+        with cols[i % 2], st.container(border=True):
+            st.subheader(sv.translate(label, lang))
+            show(a, f"sum{i}")
+
+with tab2:
+    for i, m in enumerate(st.session_state.get("chat", [])):
+        with st.chat_message(m["role"]):
+            st.write(m["content"]) if m["role"] == "user" else show(m["content"], f"chat{i}")
+    if q := st.chat_input("Ask about your policy in your language..."):
+        st.session_state.chat.append({"role": "user", "content": q})
+        with st.spinner("Searching the policy..."):
+            st.session_state.chat.append({"role": "assistant", "content": ask(q)})
+        st.rerun()

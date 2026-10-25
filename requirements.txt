@@ -1,0 +1,5 @@
+streamlit>=1.40
+pymupdf
+rank-bm25
+httpx
+python-dotenv
