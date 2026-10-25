@@ -45,7 +45,8 @@ def chat_json(system: str, user: str, temperature: float = 0.1) -> tuple[dict | 
     raw = ""
     for _ in range(2):
         resp = _post("/v1/chat/completions", {
-            "model": CHAT_MODEL, "temperature": temperature, "max_tokens": 4096,
+            "model": CHAT_MODEL, "temperature": temperature, "max_tokens": 2048,
+            "reasoning_effort": None,  # null = thinking OFF (thinking tokens were eating the whole budget)
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         })["choices"][0]
         msg = resp.get("message", {})
