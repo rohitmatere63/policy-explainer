@@ -148,7 +148,7 @@ Reply with ONE JSON object and nothing else:
  "statements": [{"text": "explanation sentence", "cites": ["<clause id>"], "quote": "verbatim words (max 25) copied from that clause"}],
  "conditions": [{"text": "an 'it depends on' condition, limit or exclusion", "cites": ["<clause id>"], "quote": "verbatim words from the clause"}],
  "conflict": true|false, "ambiguous": true|false, "needs_external": true|false}
-Copy numbers exactly. If the clauses do not answer the question, set answerable=false.
+Copy numbers exactly. If the clauses do not answer the question, set answerable=false. Output at most 4 statements and 3 conditions, keep them short, and do not think out loud.
 conflict=true if two clauses disagree. ambiguous=true for vague/discretionary wording or references to other documents.
 needs_external=true if it depends on the insurer's network, premium or the person's medical history."""
 
@@ -166,8 +166,9 @@ def answer(policy: Policy, q_en: str, lang: str, min_cov: float = 0.4) -> dict:
 
     if cov >= min_cov:
         body = "\n\n".join(f"[id={c['id']} | page {c['page']} | {c['section']} | clause {c['clause'] or '-'}]\n{c['text']}" for c in ctx)
-        a = sv.chat_json(SYSTEM, f"CLAUSES:\n{body}\n\nQUESTION: {q_en}")
+        a, raw = sv.chat_json(SYSTEM, f"CLAUSES:\n{body}\n\nQUESTION: {q_en}")
         dbg["llm_json_ok"] = a is not None
+        dbg["llm_raw_preview"] = raw[:400]
         dbg["llm_answerable"] = bool(a and a.get("answerable"))
         if a:
             dbg["raw_statements"] = len(a.get("statements", []))
