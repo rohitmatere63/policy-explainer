@@ -1,4 +1,4 @@
-"""Minimal Sarvam AI client: chat, translate, text-to-speech."""
+"""Minimal Sarvam AI client: chat, translate, text-to-speech. Model names: check docs.sarvam.ai."""
 import json
 import os
 import re
@@ -8,16 +8,17 @@ import httpx
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # must run before the os.getenv() lookups below
+    load_dotenv()  # must run before the os.getenv() model lookups below
 except ImportError:
     pass
 
-CHAT_MODEL = os.getenv("SARVAM_CHAT_MODEL", "sarvam-105b")
+CHAT_MODEL = os.getenv("SARVAM_CHAT_MODEL", "sarvam-30b")
 TRANSLATE_MODEL = os.getenv("SARVAM_TRANSLATE_MODEL", "mayura:v1")
 TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "shubh")
 
 
+@lru_cache(maxsize=1)
 def _key() -> str:
     key = os.getenv("SARVAM_API_KEY", "")
     if not key:
@@ -34,24 +35,30 @@ def _key() -> str:
 def _post(path: str, payload: dict) -> dict:
     r = httpx.post(f"https://api.sarvam.ai{path}", json=payload, timeout=90,
                    headers={"api-subscription-key": _key()})
-    if r.status_code >= 400:  # show Sarvam's own message instead of a bare "400"
+    if r.status_code >= 400:  # show Sarvam's own error message instead of a bare "400 Bad Request"
         raise RuntimeError(f"Sarvam {path} -> {r.status_code}: {r.text[:500]}")
     return r.json()
 
-def chat_json(system: str, user: str, temperature: float = 0.1) -> dict | None:
-    for _ in range(2):  # retry once if the JSON is malformed
-        out = _post("/v1/chat/completions", {
-            "model": CHAT_MODEL, "temperature": temperature, "max_tokens": 3000,
+
+def chat_json(system: str, user: str, temperature: float = 0.1) -> tuple[dict | None, str]:
+    """Returns (parsed JSON or None, raw model text for debugging). Retries once."""
+    raw = ""
+    for _ in range(2):
+        resp = _post("/v1/chat/completions", {
+            "model": CHAT_MODEL, "temperature": temperature, "max_tokens": 4096,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        })["choices"][0]["message"]["content"] or ""
-        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S)
-        m = re.search(r"\{.*\}", out, flags=re.S)
+        })["choices"][0]
+        msg = resp.get("message", {})
+        raw = msg.get("content") or ""
+        raw = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.S).strip()  # drop reasoning, even if cut off
+        m = re.search(r"\{.*\}", raw, flags=re.S)
         if m:
             try:
-                return json.loads(m.group(0))
+                return json.loads(m.group(0)), raw
             except json.JSONDecodeError:
                 pass
-    return None
+        raw = f"[finish_reason={resp.get('finish_reason')}] {raw}"
+    return None, raw
 
 
 def _split(text: str, limit: int = 900) -> list[str]:
