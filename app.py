@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 
@@ -14,11 +15,13 @@ LANGS = {"English": "en-IN", "हिन्दी (Hindi)": "hi-IN", "বাং�
          "తెలుగు (Telugu)": "te-IN", "ಕನ್ನಡ (Kannada)": "kn-IN", "മലയാളം (Malayalam)": "ml-IN",
          "मराठी (Marathi)": "mr-IN", "ગુજરાતી (Gujarati)": "gu-IN", "ਪੰਜਾਬੀ (Punjabi)": "pa-IN", "ଓଡ଼ିଆ (Odia)": "od-IN"}
 
+sv._key()  # read the API key on the main thread before worker threads start
 st.set_page_config(page_title="Policy Explainer", page_icon="🛡️", layout="wide")
 
 with st.sidebar:
     st.title("🛡️ Policy Explainer")
     lang = LANGS[st.selectbox("Language / भाषा", list(LANGS))]
+    st.session_state.debug = st.checkbox("Show debug info")
     up = st.file_uploader("Upload health policy (PDF)", type="pdf")
     if up and st.session_state.get("fname") != up.name:
         with st.spinner("Reading policy..."):
@@ -30,7 +33,11 @@ with st.sidebar:
         if pol.low_quality:
             st.warning("Low extraction quality (scanned or unusual layout). Answers may be unreliable.")
 
-st.info(sv.translate(engine.DISCLAIMER, lang))
+try:
+    st.info(sv.translate(engine.DISCLAIMER, lang))
+except Exception as e:  # show the real Sarvam error (Streamlit Cloud hides uncaught ones)
+    st.info(engine.DISCLAIMER)
+    st.error(f"Sarvam translate failed: {e}")
 if not pol:
     st.write("👈 Upload a health insurance policy PDF to begin.")
     st.stop()
@@ -53,6 +60,8 @@ def show(a: dict, key: str):
             audio = sv.text_to_speech(a["short"] or a["statements"][0]["text"], lang)
             if audio:
                 st.audio(base64.b64decode(audio), format="audio/wav")
+    if st.session_state.get("debug"):
+        st.json(a.get("debug", {}))
     for i, c in enumerate(a["citations"]):
         with st.expander(f"Page {c['page']} · {c['section']} · clause {c['clause'] or '-'}"):
             st.caption(f"“{c['quote']}”")
@@ -68,10 +77,14 @@ tab1, tab2 = st.tabs(["Coverage summary", "Ask a question"])
 
 with tab1:
     if st.button("Generate key terms summary", type="primary"):
-        bar = st.progress(0.0)
-        for i, (label, q) in enumerate(engine.SUMMARY_QUESTIONS.items()):
-            st.session_state.summary[label] = engine.answer(pol, q, lang)
-            bar.progress((i + 1) / len(engine.SUMMARY_QUESTIONS))
+        try:
+            with st.spinner("Reading the policy (about 20-30 seconds)..."):
+                items = list(engine.SUMMARY_QUESTIONS.items())
+                with ThreadPoolExecutor(4) as ex:
+                    results = list(ex.map(lambda kv: engine.answer(pol, kv[1], lang), items))
+                st.session_state.summary = {k: r for (k, _), r in zip(items, results)}
+        except Exception as e:
+            st.error(f"Sarvam error: {e}")
     cols = st.columns(2)
     for i, (label, a) in enumerate(st.session_state.get("summary", {}).items()):
         with cols[i % 2], st.container(border=True):
@@ -81,9 +94,16 @@ with tab1:
 with tab2:
     for i, m in enumerate(st.session_state.get("chat", [])):
         with st.chat_message(m["role"]):
-            st.write(m["content"]) if m["role"] == "user" else show(m["content"], f"chat{i}")
+            if m["role"] == "user":
+                st.write(m["content"])
+            else:
+                show(m["content"], f"chat{i}")
     if q := st.chat_input("Ask about your policy in your language..."):
         st.session_state.chat.append({"role": "user", "content": q})
-        with st.spinner("Searching the policy..."):
-            st.session_state.chat.append({"role": "assistant", "content": ask(q)})
-        st.rerun()
+        try:
+            with st.spinner("Searching the policy..."):
+                st.session_state.chat.append({"role": "assistant", "content": ask(q)})
+            st.rerun()
+        except Exception as e:
+            st.session_state.chat.pop()
+            st.error(f"Sarvam error: {e}")

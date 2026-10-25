@@ -1,6 +1,7 @@
 """Everything except the UI: PDF -> clauses -> BM25 search -> grounded answer -> verification."""
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import fitz  # PyMuPDF
 from rank_bm25 import BM25Plus
@@ -27,7 +28,8 @@ SUMMARY_QUESTIONS = {
     "Renewal & portability": "What are the renewal, grace period and portability terms?",
 }
 STOP = set("a an the is are was be of to in on for and or if do does can i my me what how when which this that "
-           "it with by as at from any there their under policy cover covered covers".split())
+           "it with by as at from any there their under policy cover covered covers document about tell explain".split())
+OVERVIEW_RE = re.compile(r"\b(about|overview|summar\w*|what is this|explain this|describe)\b", re.I)
 
 CLAUSE_RE = re.compile(r"^\s*((?:\d+\.)+\d*|\d+[.)]|\([a-z0-9ivx]{1,4}\)|[A-Z]\.)\s+\S")
 HEADING_RE = re.compile(r"^\s*(?:(?:section|part|annexure|schedule)\b.*|[A-Z][A-Z &/,\-()]{6,})\s*$", re.I)
@@ -76,7 +78,7 @@ class Policy:
         return chunks
 
     # ---------- retrieval ----------
-    def search(self, q: str, top: int = 6) -> tuple[list[dict], float]:
+    def search(self, q: str, top: int = 5) -> tuple[list[dict], float]:
         """Returns (top chunks, coverage 0..1 = share of question keywords found in them)."""
         qt = tok(q)
         if not qt or not self.bm25:
@@ -86,6 +88,17 @@ class Policy:
         hits = [self.chunks[i] for i in idx]
         have = set().union(*(set(tok(c["text"] + " " + c["section"])) for c in hits[:3]))
         return hits, sum(t in have for t in set(qt)) / len(set(qt))
+
+    def overview_chunks(self, n: int = 8) -> list[dict]:
+        """Broad questions ('what is this document about'): first clause of each section, spread over the document."""
+        firsts, seen = [], set()
+        for c in self.chunks:
+            if c["section"] not in seen:
+                seen.add(c["section"]); firsts.append(c)
+        if len(firsts) > n:
+            step = len(firsts) / n
+            firsts = [firsts[int(i * step)] for i in range(n)]
+        return (self.chunks[:2] + [c for c in firsts if c not in self.chunks[:2]])[:n + 2]
 
     def definitions_and_exclusions(self, q: str, n: int = 2) -> list[dict]:
         pool = [c for c in self.chunks if re.search(r"definition|exclusion", c["section"], re.I)]
@@ -116,7 +129,12 @@ def verify(item: dict, cmap: dict) -> dict | None:
     if not (text and cites and quote):
         return None
     src = " ".join(cmap[c]["text"] for c in cites)
-    if _norm(quote) not in _norm(src) or not _nums(text) <= _nums(src):
+    qn, sn = _norm(quote), _norm(src)
+    if qn not in sn:  # tolerate small wording/line-break differences: 85% of quote words must be in the clause
+        qw, sw = qn.split(), set(sn.split())
+        if len(qw) < 4 or sum(w in sw for w in qw) / len(qw) < 0.85:
+            return None
+    if not _nums(text) <= _nums(src):
         return None
     return {"text": text, "cites": cites, "quote": quote}
 
@@ -136,19 +154,29 @@ needs_external=true if it depends on the insurer's network, premium or the perso
 
 
 def answer(policy: Policy, q_en: str, lang: str, min_cov: float = 0.4) -> dict:
-    hits, cov = policy.search(q_en)
-    ctx = hits + [c for c in policy.definitions_and_exclusions(q_en) if c not in hits]
+    if OVERVIEW_RE.search(q_en) and len(tok(q_en)) <= 3:
+        hits, cov = policy.overview_chunks(), 1.0
+        ctx = hits
+    else:
+        hits, cov = policy.search(q_en)
+        ctx = hits + [c for c in policy.definitions_and_exclusions(q_en) if c not in hits]
+    dbg = {"coverage": round(cov, 2), "retrieved": [f"{c['id']} (p{c['page']})" for c in ctx]}
     cmap = {c["id"]: c for c in ctx}
     stmts, conds, short, flags, ratio = [], [], "", [], 0.0
 
     if cov >= min_cov:
         body = "\n\n".join(f"[id={c['id']} | page {c['page']} | {c['section']} | clause {c['clause'] or '-'}]\n{c['text']}" for c in ctx)
         a = sv.chat_json(SYSTEM, f"CLAUSES:\n{body}\n\nQUESTION: {q_en}")
+        dbg["llm_json_ok"] = a is not None
+        dbg["llm_answerable"] = bool(a and a.get("answerable"))
+        if a:
+            dbg["raw_statements"] = len(a.get("statements", []))
         if a and a.get("answerable"):
             raw = a.get("statements", [])
             stmts = [v for s in raw if isinstance(s, dict) and (v := verify(s, cmap))]
             conds = [v for s in a.get("conditions", []) if isinstance(s, dict) and (v := verify(s, cmap))]
             ratio = len(stmts) / max(len(raw), 1)
+            dbg["statements_verified"] = f"{len(stmts)}/{len(raw)}"
             short = str(a.get("short_answer", ""))
             if not _nums(short) <= _nums(" ".join(c["text"] for c in ctx)):
                 short = ""  # numbers in the headline must exist in the retrieved text
@@ -167,9 +195,12 @@ def answer(policy: Policy, q_en: str, lang: str, min_cov: float = 0.4) -> dict:
                 seen.add(c)
                 cites.append({"page": cmap[c]["page"], "section": cmap[c]["section"],
                               "clause": cmap[c]["clause"], "quote": s["quote"]})
-    T = lambda x: sv.translate(x, lang)
-    return {"short": T(short) if short else "",
-            "statements": [{"text": T(s["text"]), "cites": s["cites"]} for s in stmts],
-            "conditions": [T(s["text"]) for s in conds],
-            "flags": [T(FLAG_MSG[f]) for f in flags], "flag_ids": flags,
-            "citations": cites, "confidence": conf}
+    # translate every user-facing string in parallel (was one-by-one = slow)
+    texts = [short] + [s["text"] for s in stmts] + [s["text"] for s in conds] + [FLAG_MSG[f] for f in flags]
+    with ThreadPoolExecutor(8) as ex:
+        out = list(ex.map(lambda t: sv.translate(t, lang) if t else t, texts))
+    n1, n2 = 1 + len(stmts), 1 + len(stmts) + len(conds)
+    return {"short": out[0],
+            "statements": [{"text": out[1 + i], "cites": s["cites"]} for i, s in enumerate(stmts)],
+            "conditions": out[n1:n2], "flags": out[n2:], "flag_ids": flags,
+            "citations": cites, "confidence": conf, "debug": dbg}
